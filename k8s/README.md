@@ -14,6 +14,7 @@ loopback. No application or Postgres TLS configuration is needed.
 Traffic flow:
 
 ```
+host --HTTP--> ingress gateway ==mTLS==> app sidecar --plaintext--> app container
 app container --plaintext--> app sidecar ==mTLS==> postgres sidecar --plaintext--> postgres:5432
 ```
 
@@ -39,16 +40,16 @@ local pilot-agent port. That requires `/actuator/health`, hence the
 | `postgresql.yaml` | Postgres ServiceAccount, Service (`tcp-postgresql` port) and Deployment |
 | `app.yaml` | App ServiceAccount, Service and Deployment with the JDBC URL |
 | `istio-security.yaml` | STRICT `PeerAuthentication`, DB-only `AuthorizationPolicy`, explicit `ISTIO_MUTUAL` `DestinationRule` |
-| `ingress.yaml` | Optional `Gateway`, `VirtualService` and `ISTIO_MUTUAL` `DestinationRule` to expose the app via `istio-ingressgateway`; not applied by `setup.sh` |
+| `ingress.yaml` | `Gateway`, `VirtualService` and `ISTIO_MUTUAL` `DestinationRule` exposing the app via `istio-ingressgateway`; applied by `setup.sh` |
 
 ## Run
 
 From the repository root:
 
 ```bash
-./setup.sh     # starts minikube if needed, installs Istio, builds the image, deploys
-./verify.sh    # proves sidecars, mTLS certs, allowed/denied DB access, app HTTP
-./teardown.sh  # stops port-forwards, deletes the demo namespace, stops minikube
+./setup.sh     # starts minikube if needed, installs Istio, builds the image, deploys, applies the VirtualService
+./verify.sh    # proves sidecars, mTLS certs, allowed/denied DB access, app HTTP via ingress
+./teardown.sh  # deletes the demo namespace, stops minikube
 ```
 
 All scripts use `~/.kube/mtls-demo-config` as their kubeconfig (override with
@@ -61,11 +62,20 @@ Environment overrides for `setup.sh`:
   the locally built `mtls-demo:latest` (the script runs `kubectl set image`).
 - `BUILD_IMAGE=false` — skip building (image already present in the cluster).
 - `ISTIO_PROFILE=demo` — install a different Istio profile (default: `default`).
+  It must include an ingress gateway (e.g. `default` or `demo`); `setup.sh`
+  patches `istio-ingressgateway` to `NodePort`, including on an existing install.
+- `MINIKUBE_DRIVER=vfkit` — force a driver when recreating the profile
+  (default: `podman` if installed, otherwise minikube's auto-selection).
+- `MINIKUBE_PROFILE=minikube` — use a different minikube profile name.
 
 If no cluster is reachable, `setup.sh` waits briefly for an existing minikube
 VM to finish booting; if it is still unusable (a stale profile can leave an old
 IP and make `minikube start` hang on SSH), the profile is recreated and
-minikube is started with 2 CPUs / 4 GiB.
+minikube is started with 2 CPUs / 2 GiB. The Podman machine is started first,
+and stale Podman container/volume entries for the profile are removed, so a
+previous failed start cannot leave `volume with name minikube already exists`
+behind. Preferring the Podman driver also avoids vfkit ISO boots that can
+kernel-panic on some macOS hosts.
 On minikube it builds locally with Podman (or Docker as a fallback) and loads
 the image into minikube's containerd as an archive. `minikube image build` is
 deliberately avoided: minikube disables Docker in the VM with the containerd
@@ -74,10 +84,10 @@ runtime, which makes that command hang. For a non-minikube cluster it needs
 
 ## Teardown
 
-`./teardown.sh` performs a soft shutdown by default: it kills leftover app
-port-forwards, deletes the `mtls-demo` namespace (app, Postgres, secret and
-Istio policies) and stops the minikube VM while keeping it for the next run.
-It is safe to run when nothing is deployed.
+`./teardown.sh` performs a soft shutdown by default: it deletes the `mtls-demo`
+namespace (app, Postgres, secret, Istio policies and the Gateway/VirtualService)
+and stops the minikube VM while keeping it for the next run. It is safe to run
+when nothing is deployed.
 
 Environment overrides:
 
@@ -103,68 +113,53 @@ The original `docker-compose.yaml` is not managed by these scripts; use
 
 ## Reaching the app
 
-The app Service is `ClusterIP`, so it has no external IP or NodePort. STRICT
-mTLS also means a plain `curl` to a NodePort would be rejected. For debugging,
-use port-forward — it reaches the app over loopback and bypasses the sidecar.
-Direct `kubectl` commands need the demo kubeconfig exported first (the scripts
-export it only for themselves):
+`setup.sh` applies `ingress.yaml` and patches `istio-ingressgateway` to
+`NodePort`. With minikube's Docker driver the node IP is not reachable from the
+host, though, so curling that NodePort hangs. Port-forward the gateway Service
+instead; the request still goes through the Gateway/VirtualService and over
+mTLS to the app. Direct `kubectl` commands need the demo kubeconfig exported
+first (the scripts export it only for themselves):
 
 ```bash
 export KUBECONFIG="$HOME/.kube/mtls-demo-config"
+kubectl -n istio-system port-forward svc/istio-ingressgateway 8080:80
 ```
 
-Terminal 1 — leave this running:
+Then, in another shell, call the API with the gateway host header:
 
 ```bash
-kubectl -n mtls-demo port-forward svc/mtls-demo-app 8080:8080
-```
-
-Terminal 2 — call the API:
-
-```bash
-curl -s localhost:8080/actuator/health
-curl -X POST localhost:8080/users/v1 -H 'Content-Type: application/json' \
+curl -H 'Host: mtls-demo.local' 'http://127.0.0.1:8080/actuator/health'
+curl -H 'Host: mtls-demo.local' -X POST 'http://127.0.0.1:8080/users/v1' \
+  -H 'Content-Type: application/json' \
   -d '{"name":"Ada","email":"ada@example.com"}'
-curl 'localhost:8080/users/v1?email=ada@example.com'
+curl -H 'Host: mtls-demo.local' 'http://127.0.0.1:8080/users/v1?email=ada@example.com'
 ```
 
-Not reachable from the host: `192.168.64.2:8080` (no NodePort), the in-cluster
-service DNS name (resolves only inside the mesh), or
-`minikube service mtls-demo-app -n mtls-demo --url` (ClusterIP has no URL).
-Making the Service a `NodePort`/`LoadBalancer` still fails because the sidecar
-requires mTLS for traffic entering from outside the mesh. `verify.sh` briefly
-uses local port 8080 as well, so start your port-forward after it finishes, or
-use `8081:8080`.
-
-### Making the service reachable through Istio ingress
-
-`port-forward` is debug-only. To give the app a real URL, apply the optional
-`k8s/ingress.yaml` (deliberately not part of `setup.sh`):
+If your driver routes the node IP, the NodePort URL printed by `setup.sh` is an
+alternative:
 
 ```bash
-kubectl apply -f k8s/ingress.yaml
+GW_IP="$(kubectl get nodes \
+  -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+GW_PORT="$(kubectl -n istio-system get svc istio-ingressgateway \
+  -o jsonpath='{.spec.ports[?(@.name=="http2")].nodePort}')"
+echo "http://$GW_IP:$GW_PORT/  (Host: mtls-demo.local)"
 ```
 
-It creates a `Gateway` bound to the existing `istio-ingressgateway` in
-`istio-system`, a `VirtualService` routing host `mtls-demo.local` to
+`ingress.yaml` creates a `Gateway` bound to the existing `istio-ingressgateway`
+in `istio-system`, a `VirtualService` routing host `mtls-demo.local` to
 `mtls-demo-app:8080`, and an `ISTIO_MUTUAL` `DestinationRule` for the app. The
 last part matters: the ingress gateway is a mesh workload, so it initiates mTLS
-to the app and the namespace-wide STRICT policy remains satisfied.
+to the app and the namespace-wide STRICT policy remains satisfied. The app
+Service itself stays `ClusterIP`; sending plaintext HTTP straight to an app
+port would be rejected by its sidecar.
 
-Check it without a LoadBalancer IP (verified locally):
-
-```bash
-kubectl -n istio-system port-forward svc/istio-ingressgateway 8081:80
-curl -H 'Host: mtls-demo.local' http://localhost:8081/actuator/health
-```
-
-On minikube, run `minikube tunnel` (needs sudo) to assign an EXTERNAL-IP to the
-`istio-ingressgateway` LoadBalancer service, then call
-`http://<EXTERNAL-IP>/actuator/health` with the same `Host` header. Adding
-`127.0.0.1 mtls-demo.local` to `/etc/hosts` makes it browsable by name.
-
-Remove it with `kubectl delete -f k8s/ingress.yaml`; `./teardown.sh` also cleans
-it up with the namespace.
+`./verify.sh` starts its own short-lived port-forward for the HTTP checks and
+caps each curl with a connect/read timeout, so a stale NodePort address can no
+longer make it hang (`VERIFY_GW_PORT` overrides the local port 18080).
+Adding `127.0.0.1 mtls-demo.local` to `/etc/hosts` lets you omit the `Host`
+header while the port-forward runs. `./teardown.sh` removes the
+Gateway/VirtualService with the namespace.
 
 ### Local access troubleshooting
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Reverse setup.sh: stop port-forwards, delete the demo namespace, optionally
-# uninstall Istio, and stop (or delete) the local minikube cluster.
+# Reverse setup.sh: delete the demo namespace (including the Gateway and
+# VirtualService), optionally uninstall Istio, and stop (or delete) the local
+# minikube cluster.
 set -euo pipefail
 
 NS="${NS:-mtls-demo}"
@@ -24,11 +25,6 @@ cd "$ROOT_DIR"
 need() {
   command -v "$1" >/dev/null 2>&1 || { echo "ERROR: required command not found: $1" >&2; exit 1; }
 }
-
-echo "==> Stopping leftover app port-forwards"
-if command -v pkill >/dev/null 2>&1; then
-  pkill -f 'port-forward .*svc/mtls-demo-app' || echo "   none found"
-fi
 
 CLUSTER_UP=false
 if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then
