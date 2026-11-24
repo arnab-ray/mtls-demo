@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgresql
+  namespace: mtls-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: mtls-demo
+  labels:
+    app: postgresql
+spec:
+  selector:
+    app: postgresql
+  ports:
+    # `tcp-` prefix makes Istio treat this as opaque TCP (Postgres wire protocol).
+    - name: tcp-postgresql
+      port: 5432
+      targetPort: 5432
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgresql
+  namespace: mtls-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+      annotations:
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+    spec:
+      serviceAccountName: postgresql
+      containers:
+        - name: postgresql
+          image: postgres:14
+          ports:
+            - name: tcp-postgresql
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: mtls-demo-db
+          env:
+            # Keeps the PGDATA directory clean if a real volume is attached later.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Exec probes run inside the DB container, so they are not affected by
+          # STRICT mTLS (unlike HTTP/TCP probes, which would hit the sidecar).
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        # Demo-only. The app uses ddl-auto=create-drop, so no data survives a
+        # restart anyway; swap for a PVC if persistence is needed.
+        - name: data
+          emptyDir: {}

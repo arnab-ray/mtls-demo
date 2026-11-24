@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mtls-demo
+  labels:
+    # Opt this namespace into automatic Istio sidecar injection.
+    istio-injection: enabled

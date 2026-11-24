@@ -1,0 +1,86 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mtls-demo-app
+  namespace: mtls-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mtls-demo-app
+  namespace: mtls-demo
+  labels:
+    app: mtls-demo-app
+spec:
+  selector:
+    app: mtls-demo-app
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mtls-demo-app
+  namespace: mtls-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mtls-demo-app
+  template:
+    metadata:
+      labels:
+        app: mtls-demo-app
+      annotations:
+        # kubelet HTTP probes would otherwise hit the sidecar and be rejected
+        # by STRICT mTLS. Istio rewrites them to the local pilot-agent port.
+        sidecar.istio.io/rewriteAppHTTPProbers: "true"
+        # Don't let Hibernate open a JDBC connection before the sidecar is ready.
+        proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
+    spec:
+      serviceAccountName: mtls-demo-app
+      containers:
+        - name: app
+          image: mtls-demo:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # The JDBC client speaks plaintext to its local sidecar; the two
+            # sidecars do mTLS on the wire. Hence sslmode=disable is intentional.
+            - name: SPRING_DATASOURCE_URL
+              value: "jdbc:postgresql://postgresql:5432/mtls_poc?currentSchema=public&sslmode=disable&reWriteBatchedInserts=true"
+            - name: SPRING_DATASOURCE_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mtls-demo-db
+                  key: POSTGRES_USER
+            - name: SPRING_DATASOURCE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mtls-demo-db
+                  key: POSTGRES_PASSWORD
+            # `update` survives rolling restarts; `create-drop` would let the
+            # old pod drop the schema while the new pod is starting.
+            - name: SPRING_JPA_HIBERNATE_DDL_AUTO
+              value: update
+            # application.yaml sets generate-ddl: false, which suppresses
+            # Hibernate schema actions even when ddl-auto is update.
+            - name: SPRING_JPA_GENERATE_DDL
+              value: "true"
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10

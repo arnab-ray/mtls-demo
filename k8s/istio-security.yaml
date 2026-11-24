@@ -1,0 +1,46 @@
+# All workloads in the namespace must speak mTLS. This covers both the app
+# sidecar (outbound) and the Postgres sidecar (inbound).
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: mtls-demo-strict
+  namespace: mtls-demo
+spec:
+  mtls:
+    mode: STRICT
+---
+# Zero-trust: only the app's service account may connect to Postgres, and only
+# on 5432. In STRICT mode `principals` are the SPIFFE identities from the
+# client certificate, so a plaintext or wrong-identity caller cannot pass.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: postgres-only-from-app
+  namespace: mtls-demo
+spec:
+  selector:
+    matchLabels:
+      app: postgresql
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/mtls-demo/sa/mtls-demo-app
+      to:
+        - operation:
+            ports: ["5432"]
+---
+# Makes the client-side intent explicit. Auto-mTLS would already do this
+# between two sidecars in this namespace, but spelling it out avoids relying
+# on auto-detection (and documents the connection for the demo).
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: postgresql-istio-mutual
+  namespace: mtls-demo
+spec:
+  host: postgresql.mtls-demo.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
