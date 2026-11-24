@@ -73,7 +73,11 @@ else
     sleep 3
   done
   echo "client pod phase: $PHASE"
-  kubectl -n default logs pod/no-mesh-db-check 2>/dev/null | tail -3 || true
+  # The psql error here is the expected result of the rejection, not a failure
+  # of the check. Show a single-line summary so it is not mistaken for one.
+  REJECTION="$(kubectl -n default logs pod/no-mesh-db-check 2>/dev/null \
+    | grep -m1 -iE 'psql: error|connection|ssl' | tr '\n' ' ' || true)"
+  if [[ -n "$REJECTION" ]]; then echo "expected rejection: ${REJECTION}"; fi
   kubectl -n default delete pod no-mesh-db-check --ignore-not-found --wait=false >/dev/null 2>&1 || true
   if [[ "$PHASE" == "Succeeded" ]]; then
     echo "FAIL: plaintext client was allowed to reach Postgres" >&2
@@ -86,35 +90,42 @@ else
 fi
 
 echo
-echo "==> 6. HTTP smoke test against the app (port-forward bypasses the sidecar)"
-kubectl -n "$NS" port-forward svc/mtls-demo-app 8080:8080 >/dev/null 2>&1 &
+echo "==> 6. HTTP smoke test through the Gateway + VirtualService"
+# Port-forward the ingress gateway Service rather than using the node IP:
+# on minikube's Docker driver the node IP is not routable from the host, so
+# curling its NodePort simply hangs. The request still goes through the
+# Gateway/VirtualService and over mTLS to the app.
+PF_PORT="${VERIFY_GW_PORT:-18080}"
+kubectl -n istio-system port-forward svc/istio-ingressgateway "${PF_PORT}:80" \
+  >/dev/null 2>&1 &
 PF_PID=$!
 trap 'kill "$PF_PID" 2>/dev/null || true' EXIT
+APP_URL="http://127.0.0.1:${PF_PORT}"
+# Bounded timeouts: without them a stalled connection blocks the script forever.
+CURL_INGRESS=(-fsS --connect-timeout 2 --max-time 5 -H 'Host: mtls-demo.local')
 
 ready=false
-for _ in $(seq 1 30); do
-  if curl -fsS http://127.0.0.1:8080/actuator/health >/dev/null 2>&1; then
+for _ in $(seq 1 20); do
+  if curl "${CURL_INGRESS[@]}" "$APP_URL/actuator/health" >/dev/null 2>&1; then
     ready=true
     break
   fi
   sleep 1
 done
 if [[ "$ready" != "true" ]]; then
-  echo "FAIL: app did not become healthy" >&2
+  echo "FAIL: app did not become healthy through the VirtualService" >&2
+  echo "       (gateway port-forward on $PF_PORT failed; override with VERIFY_GW_PORT if it is in use)" >&2
   exit 1
 fi
 
 echo -n "health:      "
-curl -fsS http://127.0.0.1:8080/actuator/health; echo
+curl "${CURL_INGRESS[@]}" "$APP_URL/actuator/health"; echo
 echo -n "create user: "
-curl -fsS -X POST http://127.0.0.1:8080/users/v1 \
+curl "${CURL_INGRESS[@]}" -X POST "$APP_URL/users/v1" \
   -H 'Content-Type: application/json' \
   -d '{"name":"Ada","email":"ada@example.com"}'; echo
 echo -n "read user:   "
-curl -fsS "http://127.0.0.1:8080/users/v1?email=ada@example.com"; echo
-
-kill "$PF_PID" 2>/dev/null || true
-trap - EXIT
+curl "${CURL_INGRESS[@]}" "$APP_URL/users/v1?email=ada@example.com"; echo
 
 echo
 echo "All checks passed: app <-> Postgres is mTLS-protected in Istio sidecar mode."

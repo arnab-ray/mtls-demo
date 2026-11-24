@@ -1,6 +1,7 @@
-# Optional: expose the app through the Istio ingress gateway.
-# This is NOT applied by setup.sh; apply it explicitly when you want an
-# externally reachable URL instead of kubectl port-forward.
+# Expose the app through the Istio ingress gateway. Applied by setup.sh.
+# setup.sh exposes the gateway service as a NodePort, so the app is reachable
+# from the host at http://<minikube-ip>:<gateway-http-nodePort>/ with a
+# `Host: mtls-demo.local` header (no kubectl port-forward or minikube tunnel).
 apiVersion: networking.istio.io/v1
 kind: Gateway
 metadata:
